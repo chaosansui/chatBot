@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     LOCAL_MODEL_HOST: str = "localhost"
     LOCAL_MODEL_PORT: int = 8002
     
+    # Milvus 配置
+    MILVUS_HOST: str = "localhost"
+    MILVUS_PORT: str = "19530"
+    MILVUS_COLLECTION_NAME: str = "qwen_rag_docs"
+
+    # RAG 参数
+    EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
+    RAG_CHUNK_SIZE: int = 800  
+    RAG_CHUNK_OVERLAP: int = 80
+    RAG_TOP_K: int = 4
+    
+    
     @property
     def LOCAL_MODEL_URL(self) -> str:
         return f"http://{self.LOCAL_MODEL_HOST}:{self.LOCAL_MODEL_PORT}/v1/chat/completions"
