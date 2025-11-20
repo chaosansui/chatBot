@@ -1,141 +1,153 @@
-import time
-from fastapi import APIRouter, HTTPException, BackgroundTasks, status
-from fastapi.responses import StreamingResponse, JSONResponse
-from models.api_models import SimpleChatRequest, SimpleChatResponse, HealthResponse, SessionInfo
-from services.llm_service import llm_service
-from storage.session_store import session_store
-from core.config import settings
-# 只需要 astream_rag，因为我们将所有聊天转换为流式
-from core.chains import astream_rag 
-from loguru import logger
-
 import uuid
 import json
-from typing import AsyncIterator, Optional, Any
+from typing import AsyncIterator, Optional
+from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
+from loguru import logger
 
-# 初始化路由
+from models.api_models import SimpleChatRequest, HealthResponse, SessionInfo
+from services.llm_service import llm_service
+from services.rag_service import rag_service
+from storage.session_store import session_store
+from core.config import settings
+
 router = APIRouter()
 
 async def _prepare_session(session_id: Optional[str], user_id_card: Optional[str] = None) -> str:
-    """确保会话ID存在并返回它。"""
+    """确保会话ID存在"""
     if not session_id:
-
         session_id = str(uuid.uuid4())
         await session_store.create_session(session_id, user_id=user_id_card)
     else:
-
-        session = await session_store.get_or_create_session(session_id)
+        await session_store.get_or_create_session(session_id)
     return session_id
 
-
 async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
-    """内部流式处理函数，被所有 POST 聊天路由调用。"""
     if not llm_service.is_ready:
         raise HTTPException(status_code=503, detail="模型服务暂不可用")
     
-    # 1. 准备会话ID
     session_id = await _prepare_session(request.session_id, request.user_id_card)
-    
-    # 2. 定义异步生成器函数
-    async def stream_rag_response() -> AsyncIterator[bytes]:
+    history = await session_store.get_history(session_id) 
+
+    async def stream_generator() -> AsyncIterator[bytes]:
+        full_response = ""
+        found_sources = []
         
-        # 调用 core/chains.py 中的 astream_rag 函数
-        stream_generator = astream_rag(
-            question=request.message,
-            session_id=session_id,
-            user_id_card=request.user_id_card
-        )
-        
+        # 发送一个初始状态
+        yield f"data: {json.dumps({'type': 'status', 'text': '正在理解上下文...'}, ensure_ascii=False)}\n\n".encode("utf-8")
+
         try:
-            async for chunk_text in stream_generator:
-                if chunk_text:
-                    # 格式化为 SSE 格式：data: <json_payload>\n\n
-                    sse_payload = json.dumps({"content": chunk_text}, ensure_ascii=False)
-                    yield f"data: {sse_payload}\n\n".encode("utf-8")
+            chain = rag_service.get_rag_chain(request.user_id_card)
+            
+            async for event in chain.astream_events(
+                {"question": request.message, "chat_history": history},
+                version="v2"
+            ):
+                kind = event["event"]
+                name = event.get("name")
+                
+                # 1. 捕获 LLM 输出
+                if kind == "on_chat_model_stream":
+                    chunk_content = event["data"]["chunk"].content
+                    if not chunk_content:
+                        continue
+
+                    # 如果是 "改写问题" 的 LLM 在输出 -> 视为 "思考中"
+                    if name == "QuestionRewriter":
+                        # 这里可以选择不把改写的内容发给前端，只发状态
+                        # 或者发给前端显示在 "思考过程" 的折叠框里
+                        pass 
+
+                    # 如果是 "生成答案" 的 LLM 在输出 -> 视为 "正文"
+                    elif name == "AnswerGenerator":
+                        full_response += chunk_content
+                        payload = json.dumps({
+                            "type": "content",  # 标记为正文
+                            "text": chunk_content
+                        }, ensure_ascii=False)
+                        yield f"data: {payload}\n\n".encode("utf-8")
+
+                # 2. 捕获检索器开始工作
+                elif kind == "on_retriever_start":
+                     yield f"data: {json.dumps({'type': 'status', 'text': '正在检索知识库...'}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+                # 3. 捕获检索结束
+                elif kind == "on_retriever_end":
+                    docs = event["data"].get("output", [])
+                    if docs:
+                        found_sources = list(set(d.metadata.get("source", "未知") for d in docs))
+                        # 告诉前端检索到了什么
+                        msg = f"已找到 {len(docs)} 篇相关文档"
+                        yield f"data: {json.dumps({'type': 'status', 'text': msg}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+            # 4. 循环结束后，发送引用源
+            if found_sources:
+                sources_payload = json.dumps({
+                    "type": "sources",
+                    "data": found_sources
+                }, ensure_ascii=False)
+                yield f"data: {sources_payload}\n\n".encode("utf-8")
+
+            # 5. 保存历史
+            await session_store.add_message(session_id, "human", request.message)
+            await session_store.add_message(session_id, "ai", full_response)
 
         except Exception as e:
-            logger.error("❌ 流式聊天处理失败 (Session: {}): {}", session_id, e, exc_info=True) 
-            
-            error_payload = json.dumps({"error": f"服务处理失败: {str(e)}"}, ensure_ascii=False)
-            yield f"data: {error_payload}\n\n".encode("utf-8")
+            logger.error(f"流式异常: {e}")
+            err_payload = json.dumps({"type": "error", "text": str(e)}, ensure_ascii=False)
+            yield f"data: {err_payload}\n\n".encode("utf-8")
         finally:
-            # 3. 发送流结束标记
             yield f"data: [DONE]\n\n".encode("utf-8")
-            logger.info(f"会话 {session_id} 流式响应结束。")
 
-    # 返回 StreamingResponse
-    return StreamingResponse(
-        content=stream_rag_response(),
-        media_type="text/event-stream"
-    )
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+# ----------------------------------------------------
+# 路由定义
+# ----------------------------------------------------
 
-
-# 1. 统一的 /chat/stream 端点 (保持原有名称)
 @router.post("/chat/stream", name="chat_stream", tags=["Chat"])
 async def chat_stream_endpoint(request: SimpleChatRequest):
-    """
-    流式聊天端点：返回 Server-Sent Events (SSE) 格式的文本流。
-    """
     return await _streaming_handler(request)
 
-
-# 2. 将 /chat (原同步接口) 切换为流式，以兼容 VLLMChatModel
-@router.post("/chat", name="chat", tags=["Chat"])
-async def chat_streaming_compatibility(request: SimpleChatRequest):
-    """
-    兼容性端点：将原同步聊天接口重定向到流式处理，解决 LLM 的 _astream 限制。
-    """
+@router.post("/chat", name="chat_compat", tags=["Chat"])
+async def chat_compatibility(request: SimpleChatRequest):
     return await _streaming_handler(request)
 
-
-# 3. 根端点 POST 快捷方式
-@router.post("/")
+@router.post("/", tags=["Chat"])
 async def chat_root_shortcut(request: SimpleChatRequest):
-    """
-    新增 POST / 快捷方式。将请求转发给流式聊天端点。
-    """
     return await _streaming_handler(request)
 
-# ----------------------------------------------------
-# 健康检查
-# ----------------------------------------------------
 @router.get("/health", response_model=HealthResponse, tags=["Monitor"])
 async def health_check():
-    """健康检查端点"""
     model_ready = await llm_service.health_check()
+    # 简单的 RAG 状态检查
+    rag_ready = rag_service.collection is not None
     
     return HealthResponse(
-        status="healthy" if model_ready else "degraded",
+        status="healthy" if (model_ready and rag_ready) else "degraded",
         version=settings.VERSION,
         model_ready=model_ready
     )
 
 # ----------------------------------------------------
-# 会话管理和根 GET 端点
+# 会话管理
 # ----------------------------------------------------
 
 @router.get("/sessions/{session_id}", response_model=SessionInfo, tags=["Session"])
 async def get_session(session_id: str):
-    """获取会话信息"""
     session = await session_store.get_session(session_id)
     if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
+        raise HTTPException(status_code=404, detail="会话不存在")
     return session
 
 @router.delete("/sessions/{session_id}", tags=["Session"])
 async def delete_session(session_id: str):
-    """删除会话"""
     await session_store.delete_session(session_id)
     return {"message": "会话删除成功"}
 
 @router.get("/", tags=["Monitor"])
 async def root():
-    """根端点：获取应用信息"""
-    model_ready = await llm_service.health_check()
-    
     return {
-        "message": f"欢迎使用 {settings.APP_NAME}",
-        "version": settings.VERSION,
+        "app": settings.APP_NAME,
         "status": "running",
-        "model_status": "ready" if model_ready else "unavailable",
+        "docs": "/docs"
     }

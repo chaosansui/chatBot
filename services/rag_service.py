@@ -1,10 +1,11 @@
-# services/rag_service.py
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from operator import itemgetter
 from loguru import logger
 
-from langchain_core.runnables import Runnable
-from langchain_core.messages import SystemMessage, HumanMessage
+# LangChain 核心组件
+from langchain_core.runnables import Runnable, RunnablePassthrough, RunnableLambda, RunnableBranch
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.documents import Document
@@ -14,78 +15,131 @@ from core.config import settings
 from storage.vector_store import vector_store
 from services.llm_service import llm_service     
 
-
 class RAGService:
     def __init__(self):
         self.vector_store = vector_store
         self.llm = llm_service.langchain_llm
         self.collection: Optional[object] = None
 
+    async def initialize(self):
+        """初始化 RAG 服务"""
+        logger.info("⚙️ 正在初始化 RAG Service...")
+        await self.connect_milvus()
+        
+        if self.collection:
+            try:
+                self.collection.load()
+                logger.info(f"✅ Milvus Collection '{settings.COLLECTION_NAME}' 已加载到内存")
+            except Exception as e:
+                logger.warning(f"⚠️ Milvus Collection 加载失败: {e}")
+        
+        try:
+            _ = self.vector_store.embeddings
+            logger.info("✅ Embedding 模型已就绪")
+        except Exception as e:
+            logger.error(f"❌ Embedding 模型加载失败: {e}")
+
     async def connect_milvus(self):
         await self.vector_store.connect_milvus()
         self.collection = self.vector_store.collection
     
     async def process_data(self, file_paths: List[str]):
-        """
-        处理文档索引流程：确保连接 Milvus，并调用 vector_store 执行加载、切分、嵌入和存储。
-        """
         if not self.collection:
             await self.connect_milvus()
 
-        logger.info("开始文档加载、切分、嵌入和 Milvus 存储...")
-        
+        logger.info(f"📂 开始处理 {len(file_paths)} 个文件...")
         try:
-            # 索引文档的逻辑在 vector_store 中
             await self.vector_store.index_documents(file_paths=file_paths)
-            await self.connect_milvus() 
-            logger.info("文档索引流程已委托给 vector_store 完成。")
-        except AttributeError:
-            logger.error(f"❌ vector_store 对象缺少 'index_documents' 方法，无法执行索引。")
+            if self.collection:
+                self.collection.load()
+            logger.success("✅ 文档索引完成并已生效。")
+        except Exception as e:
+            logger.error(f"❌ 文档处理失败: {e}")
             raise
 
-    # ⭐️ 关键修复点：get_retriever 方法必须存在 ⭐️
     def get_retriever(self, user_id_card: Optional[str] = None) -> VectorStoreRetriever:
-        """
-        获取 Milvus 检索器，委托给 vector_store 完成。
-        """
-        # 实际调用 vector_store 实例的 get_retriever 方法
         return self.vector_store.get_retriever(user_id_card=user_id_card)
 
     def get_rag_chain(self, user_id_card: str) -> Runnable:
         
-        # RAGService 内部调用自身的 get_retriever 方法
         retriever = self.get_retriever(user_id_card=user_id_card)
+
+        # --- 步骤 1: 定义 "问题改写" 分支逻辑 ---
         
-        system_template = (
-            "你是一个智能客服机器人，擅长处理中英粤三语提问。\n"
-            "请基于提供的背景信息 (context) 简洁、准确地回答问题。\n"
-            "如果背景信息不足以回答用户问题，请明确告知用户。\n"
+        # A. 改写问题的 Prompt
+        contextualize_q_system_prompt = (
+            "给定一段聊天记录和用户最新的问题（该问题可能引用了上下文），"
+            "请将该问题改写为一个独立的、无需上下文即可理解的完整问题。"
+            "不要回答问题，只需返回改写后的问题；如果无需改写，原样返回。"
+        )
+        contextualize_q_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", contextualize_q_system_prompt),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
+            ]
+        )
+        
+        # B. 改写链 (增加 run_name="QuestionRewriter")
+        rewrite_chain = (
+            contextualize_q_prompt 
+            | self.llm.with_config(run_name="QuestionRewriter") 
+            | StrOutputParser()
+        )
+
+        # C. 分支路由：无历史直接返回问题，有历史则调用改写链
+        query_transform_branch = RunnableBranch(
+            (
+                lambda x: not x.get("chat_history"),
+                RunnableLambda(lambda x: x["question"])
+            ),
+            rewrite_chain
+        )
+
+        # D. 组合历史感知检索器
+        history_aware_retriever = query_transform_branch | retriever
+
+        # --- 步骤 2: 定义 "回答生成" 逻辑 ---
+        
+        qa_system_template = (
+            "你是一个专业的智能助手。\n"
+            "请基于以下检索到的背景信息 (context) 回答问题。\n"
+            "如果背景信息里没有答案，请直接说“由于缺乏相关信息，我无法回答这个问题”，不要编造。\n"
+            "回答要条理清晰，使用 Markdown 格式。\n\n"
             "背景信息:\n"
             "{context}"
         )
         
-        prompt = ChatPromptTemplate.from_messages(
+        qa_prompt = ChatPromptTemplate.from_messages(
             [
-                SystemMessage(content=system_template),
-                MessagesPlaceholder(variable_name="chat_history"), # 历史会话
-                HumanMessage(content="{question}"),
+                ("system", qa_system_template),
+                MessagesPlaceholder("chat_history"),
+                ("human", "{question}"),
             ]
         )
-        
-        # 这是一个简单的格式化函数，将 Document 对象转换为字符串
+
         def format_docs(docs: List[Document]) -> str:
-            return "\n\n".join(doc.page_content for doc in docs)
-            
-        # 链式调用
+            return "\n\n".join(f"[资料片段] {doc.page_content}" for doc in docs)
+
+        # --- 步骤 3: 组装检索链 (你之前可能漏掉了这个变量的定义) ---
+        
+        retrieval_chain = RunnablePassthrough.assign(
+            docs=history_aware_retriever,
+        ).assign(
+            context=lambda x: format_docs(x["docs"]),
+            sources=lambda x: x["docs"]
+        )
+
+        # --- 步骤 4: 组装最终 RAG 链 ---
+
         rag_chain = (
-            {
-                "context": retriever | format_docs, # 检索并格式化文档
-                "question": lambda x: x["question"],
-                "chat_history": lambda x: x["chat_history"],
-            }
-            | prompt
-            | self.llm
-            | StrOutputParser()
+            retrieval_chain
+            | RunnablePassthrough.assign(
+                # 增加 run_name="AnswerGenerator" 以便 API 层过滤
+                answer=qa_prompt 
+                       | self.llm.with_config(run_name="AnswerGenerator") 
+                       | StrOutputParser()
+            )
         )
         
         return rag_chain
