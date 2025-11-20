@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field,ConfigDict
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -7,6 +7,9 @@ class SimpleChatRequest(BaseModel):
     """简化聊天请求模型"""
     message: str = Field(..., min_length=1, max_length=2000, description="用户消息")
     session_id: Optional[str] = Field(None, description="会话ID")
+    
+    # ⭐️ 修复点：新增 user_id_card 字段，用于 RAG 过滤 ⭐️
+    user_id_card: Optional[str] = Field(None, description="用于RAG过滤的用户身份标识")
 
 class SimpleChatResponse(BaseModel):
     """简化聊天响应模型"""
