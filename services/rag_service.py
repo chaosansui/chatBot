@@ -2,8 +2,6 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from operator import itemgetter
 from loguru import logger
-
-# LangChain 核心组件
 from langchain_core.runnables import Runnable, RunnablePassthrough, RunnableLambda, RunnableBranch
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -61,7 +59,6 @@ class RAGService:
         return self.vector_store.get_retriever(user_id_card=user_id_card)
 
     def get_rag_chain(self, user_id_card: str) -> Runnable:
-        
         retriever = self.get_retriever(user_id_card=user_id_card)
 
         # --- 步骤 1: 定义 "问题改写" 分支逻辑 ---

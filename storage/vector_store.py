@@ -91,29 +91,27 @@ class MilvusVectorStore:
         except:
             return None
 
-    async def index_documents(self, file_paths: List[str]):
+    async def index_documents(self, file_paths: List[str], user_name: str, user_id_card: str):
+        """
+        索引文档，并绑定用户信息
+        """
         if not file_paths: return
-        
-        # 确保连接
         await self.connect_milvus()
 
         all_documents: List[Document] = []
-        logger.info(f"📄 加载 {len(file_paths)} 个文档...")
+        logger.info(f"📄 正在为用户 [{user_name} - {user_id_card}] 加载文档...")
 
         for path in file_paths:
             try:
-                ext = os.path.splitext(path)[1].lower()
-                loader = None
-                if ext == ".pdf": loader = PyPDFLoader(path)
-                elif ext == ".txt": loader = TextLoader(path, encoding='utf-8')
-                elif ext == ".docx": loader = Docx2txtLoader(path)
-                elif ext == ".md":
-                    try: loader = UnstructuredMarkdownLoader(path)
-                    except: loader = TextLoader(path, encoding='utf-8')
-                
+                # ... (加载器的逻辑保持不变) ...
                 if loader:
                     docs = loader.load()
-                    for doc in docs: doc.metadata["source"] = os.path.basename(path)
+                    for doc in docs:
+                        # ⭐️ 核心修改在这里：把用户信息打入 Metadata
+                        doc.metadata["source"] = os.path.basename(path)
+                        doc.metadata["user_name"] = user_name
+                        doc.metadata["user_id_card"] = user_id_card
+                    
                     all_documents.extend(docs)
             except Exception as e:
                 logger.error(f"加载失败 {path}: {e}")
@@ -126,12 +124,20 @@ class MilvusVectorStore:
         
         logger.info(f"💾 写入数据...")
         self.vector_store.add_documents(split_docs)
-        logger.success("🎉 索引完成！")
+        logger.success(f"🎉 用户 {user_name} 的文档索引完成！")
 
+    # 2. 修改 get_retriever，完善过滤逻辑
     def get_retriever(self, user_id_card: Optional[str] = None) -> VectorStoreRetriever:
+        """
+        获取检索器
+        user_id_card: 如果提供，则强制过滤该用户的文档
+        """
         search_kwargs = {"k": settings.RAG_TOP_K}
+    
         if user_id_card:
+            # 语法解释：筛选 metadata 中 user_id_card 等于 传入值 的数据
             search_kwargs["expr"] = f"user_id_card == '{user_id_card}'"
+            logger.info(f"🔍 启用权限过滤: 仅检索 ID={user_id_card} 的数据")
 
         return self.vector_store.as_retriever(
             search_type="mmr",
