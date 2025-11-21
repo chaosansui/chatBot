@@ -1,7 +1,9 @@
+import os
+import shutil
 import uuid
 import json
-from typing import AsyncIterator, Optional
-from fastapi import APIRouter, HTTPException, status
+from typing import AsyncIterator, Optional, List
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from loguru import logger
 
@@ -9,9 +11,18 @@ from models.api_models import SimpleChatRequest, HealthResponse, SessionInfo
 from services.llm_service import llm_service
 from services.rag_service import rag_service
 from storage.session_store import session_store
+from storage.vector_store import vector_store  # 新增：用于调用索引功能
 from core.config import settings
 
 router = APIRouter()
+
+# 定义临时文件存储目录
+TEMP_DIR = "data/temp_uploads"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# ----------------------------------------------------
+# 💬 聊天功能区 (Chat)
+# ----------------------------------------------------
 
 async def _prepare_session(session_id: Optional[str], user_id_card: Optional[str] = None) -> str:
     """确保会话ID存在"""
@@ -54,8 +65,6 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
 
                     # 如果是 "改写问题" 的 LLM 在输出 -> 视为 "思考中"
                     if name == "QuestionRewriter":
-                        # 这里可以选择不把改写的内容发给前端，只发状态
-                        # 或者发给前端显示在 "思考过程" 的折叠框里
                         pass 
 
                     # 如果是 "生成答案" 的 LLM 在输出 -> 视为 "正文"
@@ -76,7 +85,6 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
                     docs = event["data"].get("output", [])
                     if docs:
                         found_sources = list(set(d.metadata.get("source", "未知") for d in docs))
-                        # 告诉前端检索到了什么
                         msg = f"已找到 {len(docs)} 篇相关文档"
                         yield f"data: {json.dumps({'type': 'status', 'text': msg}, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -100,9 +108,6 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
             yield f"data: [DONE]\n\n".encode("utf-8")
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
-# ----------------------------------------------------
-# 路由定义
-# ----------------------------------------------------
 
 @router.post("/chat/stream", name="chat_stream", tags=["Chat"])
 async def chat_stream_endpoint(request: SimpleChatRequest):
@@ -116,10 +121,66 @@ async def chat_compatibility(request: SimpleChatRequest):
 async def chat_root_shortcut(request: SimpleChatRequest):
     return await _streaming_handler(request)
 
+# ----------------------------------------------------
+# 📂 知识库上传功能区 (Knowledge)
+# ----------------------------------------------------
+
+async def _background_indexing(temp_file_path: str, user_id: str, user_name: str):
+    """后台任务：执行索引并清理临时文件"""
+    try:
+        logger.info(f"🔄 [后台任务] 开始为用户 {user_name}({user_id}) 索引文件: {temp_file_path}")
+        
+        await vector_store.index_documents(
+            file_paths=[temp_file_path],
+            user_name=user_name,
+            user_id_card=user_id
+        )
+        logger.success(f"✅ [后台任务] 索引完成")
+    except Exception as e:
+        logger.error(f"❌ [后台任务] 索引失败: {e}")
+    finally:
+        # 清理临时文件
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+@router.post("/knowledge/upload", tags=["Knowledge"])
+async def upload_knowledge_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user_id: str = Form(..., description="用户唯一标识 (ID Card)"),
+    user_name: str = Form(..., description="用户姓名"),
+):
+    """
+    上传文档并建立索引 (支持 PDF, MD, TXT, DOCX)
+    """
+    # 1. 校验格式
+    allowed_exts = [".pdf", ".txt", ".md", ".docx"]
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    
+    if file_ext not in allowed_exts:
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式。支持列表: {allowed_exts}")
+
+    safe_filename = f"{user_id}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    file_path = os.path.join(TEMP_DIR, safe_filename)
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        logger.error(f"保存文件失败: {e}")
+        raise HTTPException(status_code=500, detail="文件上传失败")
+
+    background_tasks.add_task(_background_indexing, file_path, user_id, user_name)
+
+    return {
+        "message": "文件上传成功，正在后台处理索引...",
+        "filename": file.filename,
+        "user_id": user_id
+    }
+
 @router.get("/health", response_model=HealthResponse, tags=["Monitor"])
 async def health_check():
     model_ready = await llm_service.health_check()
-    # 简单的 RAG 状态检查
     rag_ready = rag_service.collection is not None
     
     return HealthResponse(
@@ -127,10 +188,6 @@ async def health_check():
         version=settings.VERSION,
         model_ready=model_ready
     )
-
-# ----------------------------------------------------
-# 会话管理
-# ----------------------------------------------------
 
 @router.get("/sessions/{session_id}", response_model=SessionInfo, tags=["Session"])
 async def get_session(session_id: str):

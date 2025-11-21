@@ -1,15 +1,19 @@
 import sys
 import logging
+import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from loguru import logger
+
+# 导入模块
 from api.endpoints import router as api_router
 from core.config import settings
 from services.llm_service import llm_service
 from services.rag_service import rag_service 
 from storage.session_store import session_store
 
+# --- 1. 日志拦截器配置 (保持不变，这是很好的实践) ---
 class InterceptHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -31,72 +35,75 @@ def setup_logging():
     logging.getLogger("uvicorn.access").handlers = [InterceptHandler()]
     logging.getLogger("uvicorn.error").handlers = [InterceptHandler()]
     
-    # 配置 Loguru 格式
     logger.configure(
         handlers=[
             {
                 "sink": sys.stderr,
                 "level": settings.LOG_LEVEL,
-                "format": "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+                "format": "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
             }
         ]
     )
 
-# --- 生命周期管理 ---
+# --- 2. 生命周期管理 (核心优化点) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：服务初始化和关闭"""
+    """应用启动与关闭流程"""
     
     setup_logging()
-    logger.success(f"🤖 {settings.APP_NAME} v{settings.VERSION} 正在启动...")
+    logger.info(f"🚀 正在启动 {settings.APP_NAME} v{settings.VERSION} ...")
     
+    # [A] 初始化 Redis Session
     try:
         await session_store.connect()
-        logger.success("✅ Redis 连接成功")
+        logger.success(f"✅ Redis 连接成功 ({settings.REDIS_HOST}:{settings.REDIS_PORT})")
     except Exception as e:
         logger.error(f"❌ Redis 连接失败: {e}")
-        
+        # Redis 失败可能不影响只读操作，视业务而定是否 raise e
 
+    # [B] 初始化 RAG 服务 (Milvus & Embeddings)
+    # 优化：调用 rag_service 内部的 initialize，保持 main.py 简洁
     try:
-        logger.info("⏳ 正在初始化 RAG 服务 (Milvus & Embedding)...")
-        
-    
-        await rag_service.connect_milvus()
-        if rag_service.vector_store.collection:
-            rag_service.vector_store.collection.load()
-
-        _ = rag_service.vector_store.embeddings 
-        
-        logger.success("✅ RAG 服务初始化完成 (Milvus Connected, BGE Loaded)")
+        await rag_service.initialize()
+        logger.success("✅ RAG 服务已就绪")
     except Exception as e:
         logger.error(f"❌ RAG 服务初始化失败: {e}")
 
-
+    # [C] 检查 LLM 连接
     try:
-        await llm_service.health_check()
-        logger.success(f"✅ LLM 服务连接正常: {settings.LOCAL_MODEL_URL}")
+        # 假设 llm_service 有 check_availability 或 health_check 方法
+        is_ready = await llm_service.health_check()
+        if is_ready:
+            logger.success(f"✅ LLM 服务连接正常: {settings.LOCAL_MODEL_URL}")
+        else:
+            logger.warning(f"⚠️ LLM 服务未响应")
     except Exception as e:
-        logger.error(f"❌ LLM 服务不可用: {e}") 
+        logger.error(f"❌ LLM 服务检查异常: {e}") 
 
-    logger.success("🎉 服务已就绪！")
-    logger.info(f"📚 API文档: http://{settings.HOST}:{settings.PORT}{settings.API_PREFIX}/docs")
+    # 输出访问地址
+    docs_url = f"http://{settings.HOST}:{settings.PORT}{settings.API_PREFIX}/docs"
+    logger.info(f"📚 API 文档地址: {docs_url}")
+    
+    yield # 服务运行中...
 
-    yield
-
+    # [D] 优雅关闭
     logger.info("🛑 正在停止服务...")
-    await llm_service.close()
     await session_store.close()
     logger.success("👋 再见！")
 
+# --- 3. FastAPI 应用定义 ---
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="Funki 聊天机器人",
+    description="Funki AI 智能助手 (Streaming API)",
+    # 将 docs 挂载到 API 前缀下，或者直接挂载到 /docs
     docs_url=f"{settings.API_PREFIX}/docs",
     redoc_url=f"{settings.API_PREFIX}/redoc",
+    openapi_url=f"{settings.API_PREFIX}/openapi.json",
     lifespan=lifespan
 )
 
+# CORS 配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -105,44 +112,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 挂载路由
 app.include_router(api_router, prefix=settings.API_PREFIX)
 
-
+# --- 4. 系统级健康检查 (K8s/LB 用) ---
 @app.get("/health", tags=["System"])
 async def health_check():
     """
-    Kubernetes 或 负载均衡器使用的健康检查接口
+    基础设施健康检查
     """
-    # 检查 Redis
-    redis_status = "connected" if session_store.client else "disconnected"
+    # 1. 检查 Redis
+    redis_ok = session_store.client is not None
     
-    milvus_status = "connected" if rag_service.collection else "disconnected"
-    
+    # 2. 检查 Milvus Collection 是否加载
+    milvus_ok = False
+    if rag_service.collection:
+        milvus_ok = True # 简单检查对象存在即可，不必每次都 ping
 
-    llm_status = "unknown"
-    try:
-        llm_status = "ready" 
-    except:
-        llm_status = "error"
+    # 3. 检查 LLM (可选：因为 LLM 检查耗时，高频健康检查可以跳过或缓存状态)
+    llm_ok = llm_service.is_ready
+
+    status = "healthy" if (redis_ok and milvus_ok) else "degraded"
 
     return {
-        "status": "healthy",
+        "status": status,
         "components": {
-            "redis": redis_status,
-            "milvus": milvus_status,
-            "llm": llm_status
+            "redis": "connected" if redis_ok else "disconnected",
+            "milvus": "ready" if milvus_ok else "not_ready",
+            "llm": "ready" if llm_ok else "not_ready"
         }
     }
 
 if __name__ == "__main__":
-    import uvicorn
-    
-    
     uvicorn.run(
         "main:app",
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
         workers=1,
-        log_level="info"
     )

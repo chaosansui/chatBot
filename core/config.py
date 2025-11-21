@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # --- 3. Milvus 配置 ---
     MILVUS_HOST: str = "127.0.0.1"
     MILVUS_PORT: str = "19530"
-    MILVUS_COLLECTION_NAME: str = "qwen_rag_docs"
+    MILVUS_COLLECTION_NAME: str = "funki_case"
     MILVUS_USER: str = "" 
     MILVUS_PASSWORD: str = "" 
     MILVUS_SECURE: bool = False 
