@@ -62,7 +62,7 @@ class RAGService:
                 lambda x: len(x.get("chat_history", [])) > 0,
                 rewrite_chain
             ),
-            itemgetter("question") # 默认分支：直接取 question
+            itemgetter("question")
         )
 
         # 4. 检索链 (Retrieval Chain)

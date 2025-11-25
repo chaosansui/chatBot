@@ -5,6 +5,7 @@ from loguru import logger
 from langchain_community.vectorstores import Milvus
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
@@ -66,6 +67,44 @@ class MilvusVectorStore:
                 logger.error(f"❌ Milvus 连接失败: {e}")
                 raise e
 
+    async def index_markdown_content(self, markdown_text: str, metadata: dict):
+        """
+        专门处理 OCR 转换后的 Markdown 文本
+        """
+        await self.connect_milvus()
+
+        logger.info(f"✂️ 正在进行 Markdown 结构化切分...")
+
+        # 1. 按标题层级切分 (保留章节结构)
+        headers_to_split_on = [
+            ("#", "Header 1"),
+            ("##", "Header 2"),
+            ("###", "Header 3"),
+        ]
+        
+        markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+        # 这一步会把 markdown_text 切成多个 Document，每个都带有 Header metadata
+        md_header_splits = markdown_splitter.split_text(markdown_text)
+
+        # 2. 注入业务元数据 (User ID, Name, Source)
+        for doc in md_header_splits:
+            doc.metadata.update(metadata)
+
+        # 3. 二次切分 (防止某个章节内容过长超过 Embedding 限制)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.RAG_CHUNK_SIZE, 
+            chunk_overlap=settings.RAG_CHUNK_OVERLAP
+        )
+        final_docs = text_splitter.split_documents(md_header_splits)
+
+        logger.info(f"💾 正在写入 Milvus ({len(final_docs)} 个分片)...")
+        try:
+            self.vector_store.add_documents(final_docs)
+            logger.success(f"🎉 索引完成！文档来源: {metadata.get('source')}")
+        except Exception as e:
+            logger.error(f"❌ Milvus 写入失败: {e}")
+            raise
+    
     def _ensure_scalar_index(self):
         """
         (高级优化) 确保用于过滤的标量字段有索引
@@ -95,7 +134,6 @@ class MilvusVectorStore:
                 connection_args={"host": settings.MILVUS_HOST, "port": settings.MILVUS_PORT},
                 auto_id=True,
                 drop_old=False,
-                # 强制指定主键字段和文本字段，防止版本兼容问题
                 primary_field="pk",
                 text_field="text",
                 vector_field="vector"
@@ -125,7 +163,7 @@ class MilvusVectorStore:
         LOADER_MAPPING = {
             ".pdf": PyPDFLoader,
             ".txt": TextLoader,
-            ".md": UnstructuredMarkdownLoader,
+            ".mmd": UnstructuredMarkdownLoader,
             ".docx": Docx2txtLoader,
         }
 

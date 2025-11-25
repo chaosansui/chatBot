@@ -1,0 +1,42 @@
+# Python 字节码缓存 ── 必加！
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Python 缓存目录
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 其他常见
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+instance/
+.webassets-cache
+.scrapy
+
+# Jupyter
+.ipynb_checkpoints
+
+# PyCharm / VSCode
+.idea/
+.vscode/
+*.swp
+*.swo

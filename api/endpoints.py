@@ -11,7 +11,7 @@ from models.api_models import SimpleChatRequest, HealthResponse, SessionInfo
 from services.llm_service import llm_service
 from services.rag_service import rag_service
 from storage.session_store import session_store
-from storage.vector_store import vector_store  # 新增：用于调用索引功能
+from storage.vector_store import vector_store 
 from core.config import settings
 
 router = APIRouter()
@@ -20,9 +20,6 @@ router = APIRouter()
 TEMP_DIR = "data/temp_uploads"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# ----------------------------------------------------
-# 💬 聊天功能区 (Chat)
-# ----------------------------------------------------
 
 async def _prepare_session(session_id: Optional[str], user_id_card: Optional[str] = None) -> str:
     """确保会话ID存在"""
@@ -44,7 +41,6 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
         full_response = ""
         found_sources = []
         
-        # 发送一个初始状态
         yield f"data: {json.dumps({'type': 'status', 'text': '正在理解上下文...'}, ensure_ascii=False)}\n\n".encode("utf-8")
 
         try:
@@ -57,26 +53,22 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
                 kind = event["event"]
                 name = event.get("name")
                 
-                # 1. 捕获 LLM 输出
                 if kind == "on_chat_model_stream":
                     chunk_content = event["data"]["chunk"].content
                     if not chunk_content:
                         continue
 
-                    # 如果是 "改写问题" 的 LLM 在输出 -> 视为 "思考中"
                     if name == "QuestionRewriter":
                         pass 
 
-                    # 如果是 "生成答案" 的 LLM 在输出 -> 视为 "正文"
                     elif name == "AnswerGenerator":
                         full_response += chunk_content
                         payload = json.dumps({
-                            "type": "content",  # 标记为正文
+                            "type": "content",
                             "text": chunk_content
                         }, ensure_ascii=False)
                         yield f"data: {payload}\n\n".encode("utf-8")
 
-                # 2. 捕获检索器开始工作
                 elif kind == "on_retriever_start":
                      yield f"data: {json.dumps({'type': 'status', 'text': '正在检索知识库...'}, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -121,59 +113,78 @@ async def chat_compatibility(request: SimpleChatRequest):
 async def chat_root_shortcut(request: SimpleChatRequest):
     return await _streaming_handler(request)
 
-# ----------------------------------------------------
-# 📂 知识库上传功能区 (Knowledge)
-# ----------------------------------------------------
-
-async def _background_indexing(temp_file_path: str, user_id: str, user_name: str):
-    """后台任务：执行索引并清理临时文件"""
+async def _background_indexing(temp_file_path: str, user_id: str, user_name: str, original_filename: str):
+    """后台任务：OCR -> 索引 -> 清理"""
+    generated_md_path = None
     try:
-        logger.info(f"🔄 [后台任务] 开始为用户 {user_name}({user_id}) 索引文件: {temp_file_path}")
+        logger.info(f"🔄 [1/3] 开始 OCR 识别: {temp_file_path}")
         
-        await vector_store.index_documents(
-            file_paths=[temp_file_path],
-            user_name=user_name,
-            user_id_card=user_id
-        )
-        logger.success(f"✅ [后台任务] 索引完成")
+        # A. 调用 OCR 服务
+        # 注意：这里解包返回的两个值：内容 和 路径
+        markdown_content, generated_md_path = await ocr_service.file_to_markdown(temp_file_path)
+        
+        # B. 准备元数据
+        metadata = {
+            "source": original_filename,
+            "user_id_card": user_id,
+            "user_name": user_name,
+            "type": "ocr_document"
+        }
+
+        logger.info(f"🔄 [2/3] 开始向量化索引 ({len(markdown_content)} 字符)...")
+        
+        # C. 调用 Markdown 专用索引方法
+        await vector_store.index_markdown_content(markdown_content, metadata)
+        
+        logger.success(f"✅ [3/3] 全流程处理完成！")
+        
     except Exception as e:
-        logger.error(f"❌ [后台任务] 索引失败: {e}")
+        logger.error(f"❌ 后台处理失败: {e}")
     finally:
-        # 清理临时文件
+        # D. 清理工作 (非常重要！)
+        # 1. 删除用户上传的原始文件
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        
+        # 2. 删除 OCR 生成的 .md 文件 (因为已经存入数据库了，文件可以删掉节省空间)
+        if generated_md_path and os.path.exists(generated_md_path):
+            os.remove(generated_md_path)
+            logger.debug(f"🗑️ 已清理临时 MD 文件: {generated_md_path}")
 
 @router.post("/knowledge/upload", tags=["Knowledge"])
 async def upload_knowledge_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user_id: str = Form(..., description="用户唯一标识 (ID Card)"),
+    user_id: str = Form(..., description="用户唯一标识"),
     user_name: str = Form(..., description="用户姓名"),
 ):
     """
-    上传文档并建立索引 (支持 PDF, MD, TXT, DOCX)
+    上传文档 (PDF/图片) -> DeepSeek OCR -> RAG
     """
-    # 1. 校验格式
-    allowed_exts = [".pdf", ".txt", ".md", ".docx"]
+    # ... (之前的校验代码保持不变) ...
+    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"] # 你的 OCR 代码只支持这些
     file_ext = os.path.splitext(file.filename)[1].lower()
     
     if file_ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail=f"不支持的文件格式。支持列表: {allowed_exts}")
+        raise HTTPException(status_code=400, detail=f"OCR 模式仅支持: {allowed_exts}")
 
-    safe_filename = f"{user_id}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    # 保存临时文件
+    safe_filename = f"{user_id}_{uuid.uuid4().hex[:8]}{file_ext}"
     file_path = os.path.join(TEMP_DIR, safe_filename)
     
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        logger.error(f"保存文件失败: {e}")
-        raise HTTPException(status_code=500, detail="文件上传失败")
+        logger.error(f"保存失败: {e}")
+        raise HTTPException(status_code=500, detail="文件保存失败")
 
-    background_tasks.add_task(_background_indexing, file_path, user_id, user_name)
+    # 启动后台任务
+    # 注意传递 file.filename 用于记录原始文件名
+    background_tasks.add_task(_background_indexing, file_path, user_id, user_name, file.filename)
 
     return {
-        "message": "文件上传成功，正在后台处理索引...",
+        "message": "文件已接收，正在后台进行 DeepSeek OCR 识别与索引...",
         "filename": file.filename,
         "user_id": user_id
     }
