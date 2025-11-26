@@ -7,7 +7,8 @@ from langchain_core.documents import Document
 from core.config import settings
 from core.prompts import get_rewrite_prompt, get_qa_prompt 
 from storage.vector_store import vector_store
-from services.llm_service import llm_service     
+from services.llm_service import llm_service   
+from operator import itemgetter  
 
 class RAGService:
     def __init__(self):
