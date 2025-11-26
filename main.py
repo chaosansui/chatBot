@@ -53,25 +53,20 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info(f"🚀 正在启动 {settings.APP_NAME} v{settings.VERSION} ...")
     
-    # [A] 初始化 Redis Session
     try:
         await session_store.connect()
         logger.success(f"✅ Redis 连接成功 ({settings.REDIS_HOST}:{settings.REDIS_PORT})")
     except Exception as e:
         logger.error(f"❌ Redis 连接失败: {e}")
-        # Redis 失败可能不影响只读操作，视业务而定是否 raise e
-
-    # [B] 初始化 RAG 服务 (Milvus & Embeddings)
-    # 优化：调用 rag_service 内部的 initialize，保持 main.py 简洁
+   
     try:
         await rag_service.initialize()
         logger.success("✅ RAG 服务已就绪")
     except Exception as e:
         logger.error(f"❌ RAG 服务初始化失败: {e}")
 
-    # [C] 检查 LLM 连接
+
     try:
-        # 假设 llm_service 有 check_availability 或 health_check 方法
         is_ready = await llm_service.health_check()
         if is_ready:
             logger.success(f"✅ LLM 服务连接正常: {settings.LOCAL_MODEL_URL}")
@@ -96,7 +91,6 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
     description="Funki AI 智能助手 (Streaming API)",
-    # 将 docs 挂载到 API 前缀下，或者直接挂载到 /docs
     docs_url=f"{settings.API_PREFIX}/docs",
     redoc_url=f"{settings.API_PREFIX}/redoc",
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
