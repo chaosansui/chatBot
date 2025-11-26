@@ -3,26 +3,27 @@ import shutil
 import uuid
 import json
 from typing import AsyncIterator, Optional, List
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from loguru import logger
 
 from models.api_models import SimpleChatRequest, HealthResponse, SessionInfo
 from services.llm_service import llm_service
 from services.rag_service import rag_service
+from services.ocr_service import ocr_service
 from storage.session_store import session_store
 from storage.vector_store import vector_store 
 from core.config import settings
 
 router = APIRouter()
 
-# 定义临时文件存储目录
-TEMP_DIR = "data/temp_uploads"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Shared directory for uploaded files (Must match OCR service config)
+SHARED_INPUT_DIR = "/mnt/data/AI-chatBot/data/temp_inputs"
+os.makedirs(SHARED_INPUT_DIR, exist_ok=True)
 
 
 async def _prepare_session(session_id: Optional[str], user_id_card: Optional[str] = None) -> str:
-    """确保会话ID存在"""
+    """Ensure session exists or create new one."""
     if not session_id:
         session_id = str(uuid.uuid4())
         await session_store.create_session(session_id, user_id=user_id_card)
@@ -32,7 +33,7 @@ async def _prepare_session(session_id: Optional[str], user_id_card: Optional[str
 
 async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
     if not llm_service.is_ready:
-        raise HTTPException(status_code=503, detail="模型服务暂不可用")
+        raise HTTPException(status_code=503, detail="LLM service unavailable")
     
     session_id = await _prepare_session(request.session_id, request.user_id_card)
     history = await session_store.get_history(session_id) 
@@ -41,7 +42,8 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
         full_response = ""
         found_sources = []
         
-        yield f"data: {json.dumps({'type': 'status', 'text': '正在理解上下文...'}, ensure_ascii=False)}\n\n".encode("utf-8")
+        # Initial status
+        yield f"data: {json.dumps({'type': 'status', 'text': 'Understanding context...'}, ensure_ascii=False)}\n\n".encode("utf-8")
 
         try:
             chain = rag_service.get_rag_chain(request.user_id_card)
@@ -53,14 +55,17 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
                 kind = event["event"]
                 name = event.get("name")
                 
+                # 1. LLM Output Stream
                 if kind == "on_chat_model_stream":
                     chunk_content = event["data"]["chunk"].content
                     if not chunk_content:
                         continue
 
+                    # Question Rewriter output (Optional: skip or show as 'thinking')
                     if name == "QuestionRewriter":
                         pass 
 
+                    # Final Answer output
                     elif name == "AnswerGenerator":
                         full_response += chunk_content
                         payload = json.dumps({
@@ -69,18 +74,19 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
                         }, ensure_ascii=False)
                         yield f"data: {payload}\n\n".encode("utf-8")
 
+                # 2. Retriever Start
                 elif kind == "on_retriever_start":
-                     yield f"data: {json.dumps({'type': 'status', 'text': '正在检索知识库...'}, ensure_ascii=False)}\n\n".encode("utf-8")
+                     yield f"data: {json.dumps({'type': 'status', 'text': 'Searching knowledge base...'}, ensure_ascii=False)}\n\n".encode("utf-8")
 
-                # 3. 捕获检索结束
+                # 3. Retriever End
                 elif kind == "on_retriever_end":
                     docs = event["data"].get("output", [])
                     if docs:
-                        found_sources = list(set(d.metadata.get("source", "未知") for d in docs))
-                        msg = f"已找到 {len(docs)} 篇相关文档"
+                        found_sources = list(set(d.metadata.get("source", "Unknown") for d in docs))
+                        msg = f"Found {len(docs)} relevant docs"
                         yield f"data: {json.dumps({'type': 'status', 'text': msg}, ensure_ascii=False)}\n\n".encode("utf-8")
 
-            # 4. 循环结束后，发送引用源
+            # 4. Send Sources
             if found_sources:
                 sources_payload = json.dumps({
                     "type": "sources",
@@ -88,12 +94,12 @@ async def _streaming_handler(request: SimpleChatRequest) -> StreamingResponse:
                 }, ensure_ascii=False)
                 yield f"data: {sources_payload}\n\n".encode("utf-8")
 
-            # 5. 保存历史
+            # 5. Save History
             await session_store.add_message(session_id, "human", request.message)
             await session_store.add_message(session_id, "ai", full_response)
 
         except Exception as e:
-            logger.error(f"流式异常: {e}")
+            logger.error(f"Stream Error: {e}")
             err_payload = json.dumps({"type": "error", "text": str(e)}, ensure_ascii=False)
             yield f"data: {err_payload}\n\n".encode("utf-8")
         finally:
@@ -113,17 +119,18 @@ async def chat_compatibility(request: SimpleChatRequest):
 async def chat_root_shortcut(request: SimpleChatRequest):
     return await _streaming_handler(request)
 
-async def _background_indexing(temp_file_path: str, user_id: str, user_name: str, original_filename: str):
-    """后台任务：OCR -> 索引 -> 清理"""
+async def _background_pipeline(local_file_path: str, user_id: str, user_name: str, original_filename: str):
+    """
+    Background Task: OCR -> Read MD -> Indexing -> Cleanup
+    """
     generated_md_path = None
     try:
-        logger.info(f"🔄 [1/3] 开始 OCR 识别: {temp_file_path}")
+        logger.info(f"🔄 [Task Start] User:{user_name}({user_id}) File:{original_filename}")
         
-        # A. 调用 OCR 服务
-        # 注意：这里解包返回的两个值：内容 和 路径
-        markdown_content, generated_md_path = await ocr_service.file_to_markdown(temp_file_path)
+        # A. Call OCR Service (Returns content + file path)
+        markdown_content, generated_md_path = await ocr_service.file_to_markdown(local_file_path)
         
-        # B. 准备元数据
+        # B. Prepare Metadata
         metadata = {
             "source": original_filename,
             "user_id_card": user_id,
@@ -131,63 +138,88 @@ async def _background_indexing(temp_file_path: str, user_id: str, user_name: str
             "type": "ocr_document"
         }
 
-        logger.info(f"🔄 [2/3] 开始向量化索引 ({len(markdown_content)} 字符)...")
+        logger.info(f"🔄 [Indexing] Processing content length: {len(markdown_content)}...")
         
-        # C. 调用 Markdown 专用索引方法
+        # C. Vector Indexing (Markdown aware)
         await vector_store.index_markdown_content(markdown_content, metadata)
         
-        logger.success(f"✅ [3/3] 全流程处理完成！")
+        logger.success(f"✅ [Done] File processed successfully: {original_filename}")
         
     except Exception as e:
-        logger.error(f"❌ 后台处理失败: {e}")
+        logger.error(f"❌ [Failed] Background task error: {e}")
     finally:
-        # D. 清理工作 (非常重要！)
-        # 1. 删除用户上传的原始文件
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        # D. Cleanup Temp Files
+        # Delete source file from input dir
+        if os.path.exists(local_file_path):
+            os.remove(local_file_path)
         
-        # 2. 删除 OCR 生成的 .md 文件 (因为已经存入数据库了，文件可以删掉节省空间)
+        # Delete generated MD file from output dir
         if generated_md_path and os.path.exists(generated_md_path):
             os.remove(generated_md_path)
-            logger.debug(f"🗑️ 已清理临时 MD 文件: {generated_md_path}")
+
 
 @router.post("/knowledge/upload", tags=["Knowledge"])
 async def upload_knowledge_file(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    user_id: str = Form(..., description="用户唯一标识"),
-    user_name: str = Form(..., description="用户姓名"),
+    files: List[UploadFile] = File(..., description="Upload multiple files"), 
+    user_id: str = Form(..., description="User ID Card"),
+    user_name: str = Form(..., description="User Name"),
 ):
     """
-    上传文档 (PDF/图片) -> DeepSeek OCR -> RAG
+    Batch Upload -> OCR Pipeline -> RAG Indexing
     """
-    # ... (之前的校验代码保持不变) ...
-    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"] # 你的 OCR 代码只支持这些
-    file_ext = os.path.splitext(file.filename)[1].lower()
+    uploaded_details = []
+    failed_files = []
     
-    if file_ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail=f"OCR 模式仅支持: {allowed_exts}")
+    # Allowed formats
+    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"]
 
-    # 保存临时文件
-    safe_filename = f"{user_id}_{uuid.uuid4().hex[:8]}{file_ext}"
-    file_path = os.path.join(TEMP_DIR, safe_filename)
-    
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        logger.error(f"保存失败: {e}")
-        raise HTTPException(status_code=500, detail="文件保存失败")
+    # Process each file
+    for file in files:
+        original_name = file.filename
+        ext = os.path.splitext(original_name)[1].lower()
 
-    # 启动后台任务
-    # 注意传递 file.filename 用于记录原始文件名
-    background_tasks.add_task(_background_indexing, file_path, user_id, user_name, file.filename)
+        # 1. Format Check
+        if ext not in allowed_exts:
+            logger.warning(f"Skipping unsupported file: {original_name}")
+            failed_files.append({"filename": original_name, "reason": "Unsupported format"})
+            continue
+
+        # 2. Generate Unique Filename
+        unique_filename = f"{user_id}_{uuid.uuid4().hex[:8]}{ext}"
+        abs_file_path = os.path.join(SHARED_INPUT_DIR, unique_filename)
+
+        # 3. Save to Shared Directory
+        try:
+            with open(abs_file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+        except Exception as e:
+            logger.error(f"Save failed for {original_name}: {e}")
+            failed_files.append({"filename": original_name, "reason": "Save failed"})
+            continue
+
+        # 4. Queue Background Task
+        background_tasks.add_task(
+            _background_pipeline, 
+            abs_file_path,   
+            user_id,         
+            user_name,       
+            original_name    
+        )
+
+        uploaded_details.append(original_name)
 
     return {
-        "message": "文件已接收，正在后台进行 DeepSeek OCR 识别与索引...",
-        "filename": file.filename,
-        "user_id": user_id
+        "code": 200,
+        "message": f"Received {len(uploaded_details)}, Failed {len(failed_files)}",
+        "success_files": uploaded_details,
+        "failed_files": failed_files,
+        "task_info": {
+            "user_name": user_name,
+            "user_id": user_id
+        }
     }
+
 
 @router.get("/health", response_model=HealthResponse, tags=["Monitor"])
 async def health_check():
@@ -204,13 +236,13 @@ async def health_check():
 async def get_session(session_id: str):
     session = await session_store.get_session(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="会话不存在")
+        raise HTTPException(status_code=404, detail="Session not found")
     return session
 
 @router.delete("/sessions/{session_id}", tags=["Session"])
 async def delete_session(session_id: str):
     await session_store.delete_session(session_id)
-    return {"message": "会话删除成功"}
+    return {"message": "Session deleted"}
 
 @router.get("/", tags=["Monitor"])
 async def root():
