@@ -213,26 +213,16 @@ class MilvusVectorStore:
             logger.error(f"❌ Milvus 写入失败: {e}")
             raise
 
-    def get_retriever(self, user_id_card: Optional[str] = None) -> VectorStoreRetriever:
-        """
-        获取检索器
-        """
-        # 默认检索参数
+    def get_retriever(self, user_id_card: Optional[str] = None, k: int = 4) -> VectorStoreRetriever:
         search_kwargs = {
-            "k": settings.RAG_TOP_K,
-            # "score_threshold": 0.6 # 可选：设置相似度阈值，过滤掉太不相关的
+            "k": k,
         }
-    
+        
         if user_id_card:
-            # 这里的 expr 语法依赖于 LangChain 如何存储 metadata
-            # 现在的 LangChain Milvus 实现通常将 metadata 存为 JSON 字段或独立字段
-            # 这是一个潜在的坑：如果 metadata 是 JSON 字符串，这里的 expr 可能需要调整
-            # 但如果是标准实现，这样写通常没问题
             search_kwargs["expr"] = f"user_id_card == '{user_id_card}'"
-            logger.debug(f"🔍 检索过滤条件: {search_kwargs['expr']}")
-
+            
         return self.vector_store.as_retriever(
-            search_type="mmr", # 保持 MMR 以获得多样性
+            search_type="mmr",
             search_kwargs=search_kwargs
         )
     
