@@ -24,7 +24,6 @@ class Settings(BaseSettings):
     def LOCAL_MODEL_URL(self) -> str:
         return f"http://{self.LOCAL_MODEL_HOST}:{self.LOCAL_MODEL_PORT}{self.LOCAL_MODEL_API_PATH}"
     
-    # 模型调用参数
     MODEL_TIMEOUT: int = 60
     MODEL_MAX_TOKENS: int = 2048
     MODEL_TEMPERATURE: float = 0.7
@@ -43,7 +42,6 @@ class Settings(BaseSettings):
     
     # --- 4. RAG (检索增强生成) ---
     
-    # 本地 Embedding 模型 (如 BGE-M3 via vLLM/TEI)
     EMBEDDING_API_HOST: str = "localhost" 
     EMBEDDING_API_PORT: int = 10010       
     EMBEDDING_MODEL_NAME: str = "bge"
@@ -52,7 +50,6 @@ class Settings(BaseSettings):
     def EMBEDDING_API_URL(self) -> str:
         return f"http://{self.EMBEDDING_API_HOST}:{self.EMBEDDING_API_PORT}/v1/embeddings"
     
-    # 切分策略
     RAG_CHUNK_SIZE: int = 800 
     RAG_CHUNK_OVERLAP: int = 100
     RAG_TOP_K: int = 4
@@ -83,6 +80,12 @@ class Settings(BaseSettings):
             return ["*"]
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
     
+    # --- 7. reranker 配置 ---
+    RERANK_MODEL_NAME: str = "/mnt/data/models/inference/bge-reranker-v2-m3" 
+    
+    RAG_SEARCH_K: int = 15
+    RAG_RERANK_TOP_K: int = 5
+    RERANK_DEVICE: str = "cuda" 
 
 # 全局配置实例
 settings = Settings()
