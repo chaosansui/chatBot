@@ -158,11 +158,8 @@ async def upload_knowledge_file(
     user_id: str = Form(..., description="用户唯一标识"),
     user_name: str = Form(..., description="用户姓名"),
 ):
-    """
-    上传文档 (PDF/图片) -> DeepSeek OCR -> RAG
-    """
-    # ... (之前的校验代码保持不变) ...
-    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"] # 你的 OCR 代码只支持这些
+
+    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"] 
     file_ext = os.path.splitext(file.filename)[1].lower()
     
     if file_ext not in allowed_exts:
