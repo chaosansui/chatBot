@@ -39,26 +39,16 @@ class RAGService:
         except Exception as e:
             logger.error(f"❌ RAG 服务初始化失败: {e}")
 
-    def get_rag_chain(self, user_id_card: str) -> Runnable:
-        """构建 RAG 执行链 (含 Manual Rerank)"""
+    def get_rag_chain(self) -> Runnable:
         
-        # --- 1. 基础检索器 ---
-        # 增加 k 值，确保 Rerank 有足够的候选集
         base_retriever = self.vector_store.get_retriever(
-            user_id_card=user_id_card, 
             k=getattr(settings, "RAG_SEARCH_K", 15)
         )
-
-        # --- 2. 辅助函数定义 (必须在使用前定义!) ---
-
-        # A. Rerank 步骤函数
+        
         def rerank_step(inputs):
             query = inputs["query"]
             docs = inputs["docs"]
-            # 调用手动实现的 rerank 服务
             return rerank_service.rerank(query, docs)
-
-        # B. 文档格式化函数 (修复了 NameError)
         def format_docs(docs: List[Document]) -> str:
             if not docs: 
                 return "未找到相关背景信息。"
@@ -66,7 +56,6 @@ class RAGService:
             formatted_docs = []
             for i, doc in enumerate(docs):
                 source_name = doc.metadata.get("source") or "未知文件"
-                # 显示 Rerank 分数 (如果有)
                 score_info = ""
                 if 'relevance_score' in doc.metadata:
                     score_info = f" (相关度: {doc.metadata['relevance_score']:.4f})"
