@@ -4,11 +4,12 @@ from sentence_transformers import CrossEncoder
 from langchain_core.documents import Document
 from loguru import logger
 from core.config import settings
+import setproctitle   
+setproctitle.setproctitle("reranker")
 
 class RerankService:
     def __init__(self):
         self._model = None
-        # 你的配置里定义的模型名称，例如 "BAAI/bge-reranker-v2-m3"
         self.model_name = getattr(settings, "RERANK_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
         self.device = getattr(settings, "RERANK_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
         self.top_k = getattr(settings, "RAG_RERANK_TOP_K", 5)

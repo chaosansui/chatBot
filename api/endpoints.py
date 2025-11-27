@@ -165,27 +165,47 @@ async def upload_knowledge_file(
     user_id: str = Form(..., description="User ID Card"),
     user_name: str = Form(..., description="User Name"),
 ):
-
-    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"] 
-    file_ext = os.path.splitext(file.filename)[1].lower()
+    """
+    Batch Upload -> OCR Pipeline -> RAG Indexing
+    """
+    uploaded_details = []
+    failed_files = []
     
-    if file_ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail=f"OCR 模式仅支持: {allowed_exts}")
+    # Allowed formats
+    allowed_exts = [".pdf", ".jpg", ".png", ".jpeg"]
+    for file in files:
+        original_name = file.filename
+        ext = os.path.splitext(original_name)[1].lower()
 
-    # 保存临时文件
-    safe_filename = f"{user_id}_{uuid.uuid4().hex[:8]}{file_ext}"
-    file_path = os.path.join(TEMP_DIR, safe_filename)
-    
-    try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        logger.error(f"保存失败: {e}")
-        raise HTTPException(status_code=500, detail="文件保存失败")
+        # 1. Format Check
+        if ext not in allowed_exts:
+            logger.warning(f"Skipping unsupported file: {original_name}")
+            failed_files.append({"filename": original_name, "reason": "Unsupported format"})
+            continue
 
-    # 启动后台任务
-    # 注意传递 file.filename 用于记录原始文件名
-    background_tasks.add_task(_background_indexing, file_path, user_id, user_name, file.filename)
+        # 2. Generate Unique Filename
+        unique_filename = f"{user_id}_{uuid.uuid4().hex[:8]}{ext}"
+        abs_file_path = os.path.join(SHARED_INPUT_DIR, unique_filename)
+
+        # 3. Save to Shared Directory
+        try:
+            with open(abs_file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+        except Exception as e:
+            logger.error(f"Save failed for {original_name}: {e}")
+            failed_files.append({"filename": original_name, "reason": "Save failed"})
+            continue
+
+        # 4. Queue Background Task
+        background_tasks.add_task(
+            _background_pipeline, 
+            abs_file_path,   
+            user_id,         
+            user_name,       
+            original_name    
+        )
+
+        uploaded_details.append(original_name)
 
     return {
         "code": 200,
