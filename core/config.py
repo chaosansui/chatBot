@@ -85,7 +85,7 @@ class Settings(BaseSettings):
     
     RAG_SEARCH_K: int = 15
     RAG_RERANK_TOP_K: int = 5
-    RERANK_DEVICE: str = "cuda" 
+    RERANK_DEVICE: str = "cuda:3" 
 
 # 全局配置实例
 settings = Settings()
